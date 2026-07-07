@@ -15,7 +15,7 @@
 package driver
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
@@ -43,8 +43,7 @@ const (
 
 	//Time duration CNI waits for an IPv6 address assigned to an interface
 	//to move to stable state before error'ing out.
-	v6DADTimeout                = 10 * time.Second
-	MAX_MAC_GENERATION_ATTEMPTS = 10
+	v6DADTimeout = 10 * time.Second
 )
 
 type VirtualInterfaceMetadata struct {
@@ -115,41 +114,80 @@ func newCreateVethPairContext(contVethName string, hostVethName string, ipAddr *
 
 // run defines the closure to execute within the container's namespace to create the veth pair
 func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
-	veth := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{
-			Name:  createVethContext.contVethName,
-			Flags: net.FlagUp,
-			MTU:   createVethContext.mtu,
-		},
-		PeerName:         createVethContext.hostVethName,
-		PeerHardwareAddr: createVethContext.hostMACAddr,
+	podNS, err := ns.GetCurrentNS()
+	if err != nil {
+		return errors.Wrap(err, "setup NS network: failed to get pod netns")
 	}
+	defer podNS.Close()
 
-	if err := createVethContext.netLink.LinkAdd(veth); err != nil {
+	var hostVeth netlink.Link
+	if err := hostNS.Do(func(_ ns.NetNS) error {
+		veth := &netlink.Veth{
+			LinkAttrs: netlink.LinkAttrs{
+				Name:         createVethContext.hostVethName,
+				Flags:        net.FlagUp,
+				MTU:          createVethContext.mtu,
+				HardwareAddr: createVethContext.hostMACAddr,
+			},
+			PeerName:      createVethContext.contVethName,
+			PeerNamespace: netlink.NsFd(podNS.Fd()),
+		}
+
+		start := time.Now()
+		if err := createVethContext.netLink.LinkAdd(veth); err != nil {
+			createVethContext.log.Debugf("LETHE_TIMING step=host.LinkAddVethPeerNs hostVeth=%s contVeth=%s duration_ms=%d err=%v",
+				createVethContext.hostVethName, createVethContext.contVethName, time.Since(start).Milliseconds(), err)
+			return err
+		}
+		createVethContext.log.Debugf("LETHE_TIMING step=host.LinkAddVethPeerNs hostVeth=%s contVeth=%s duration_ms=%d err=<nil>",
+			createVethContext.hostVethName, createVethContext.contVethName, time.Since(start).Milliseconds())
+
+		start = time.Now()
+		var err error
+		hostVeth, err = createVethContext.netLink.LinkByName(createVethContext.hostVethName)
+		if err != nil {
+			createVethContext.log.Debugf("LETHE_TIMING step=host.LinkByNameCreatedHost hostVeth=%s duration_ms=%d err=%v",
+				createVethContext.hostVethName, time.Since(start).Milliseconds(), err)
+			return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.hostVethName)
+		}
+		createVethContext.log.Debugf("LETHE_TIMING step=host.LinkByNameCreatedHost hostVeth=%s duration_ms=%d err=<nil>",
+			createVethContext.hostVethName, time.Since(start).Milliseconds())
+
+		// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
+		// veth won't get a link local address unless it's set to UP state.
+		start = time.Now()
+		if err = createVethContext.netLink.LinkSetUp(hostVeth); err != nil {
+			createVethContext.log.Debugf("LETHE_TIMING step=host.LinkSetUpCreatedHost hostVeth=%s duration_ms=%d err=%v",
+				createVethContext.hostVethName, time.Since(start).Milliseconds(), err)
+			return errors.Wrapf(err, "setup NS network: failed to set link %q up", createVethContext.hostVethName)
+		}
+		createVethContext.log.Debugf("LETHE_TIMING step=host.LinkSetUpCreatedHost hostVeth=%s duration_ms=%d err=<nil>",
+			createVethContext.hostVethName, time.Since(start).Milliseconds())
+		return nil
+	}); err != nil {
 		return err
 	}
 
-	hostVeth, err := createVethContext.netLink.LinkByName(createVethContext.hostVethName)
-	if err != nil {
-		return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.hostVethName)
-	}
-
-	// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
-	// veth won't get a link local address unless it's set to UP state.
-	if err = createVethContext.netLink.LinkSetUp(hostVeth); err != nil {
-		return errors.Wrapf(err, "setup NS network: failed to set link %q up", createVethContext.hostVethName)
-	}
-
+	start := time.Now()
 	contVeth, err := createVethContext.netLink.LinkByName(createVethContext.contVethName)
 	if err != nil {
+		createVethContext.log.Debugf("LETHE_TIMING step=container.LinkByNameCont contVeth=%s duration_ms=%d err=%v",
+			createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 		return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.contVethName)
 	}
+	createVethContext.log.Debugf("LETHE_TIMING step=container.LinkByNameCont contVeth=%s duration_ms=%d err=<nil>",
+		createVethContext.contVethName, time.Since(start).Milliseconds())
 
 	// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
 	// veth won't get a link local address unless it's set to UP state.
+	start = time.Now()
 	if err = createVethContext.netLink.LinkSetUp(contVeth); err != nil {
+		createVethContext.log.Debugf("LETHE_TIMING step=container.LinkSetUpCont contVeth=%s duration_ms=%d err=%v",
+			createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 		return errors.Wrapf(err, "setup NS network: failed to set link %q up", createVethContext.contVethName)
 	}
+	createVethContext.log.Debugf("LETHE_TIMING step=container.LinkSetUpCont contVeth=%s duration_ms=%d err=<nil>",
+		createVethContext.contVethName, time.Since(start).Milliseconds())
 
 	// this means it's a V6 IP address
 	if createVethContext.ipAddr.IP.To4() == nil {
@@ -201,13 +239,18 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		rtTable = createVethContext.index
 	}
 
+	start = time.Now()
 	if err = createVethContext.netLink.RouteReplace(&netlink.Route{
 		LinkIndex: contVeth.Attrs().Index,
 		Scope:     netlink.SCOPE_LINK,
 		Dst:       gwNet,
 		Table:     rtTable}); err != nil {
+		createVethContext.log.Debugf("LETHE_TIMING step=container.RouteReplaceGateway contVeth=%s duration_ms=%d err=%v",
+			createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 		return errors.Wrap(err, "setup NS network: failed to add default gateway")
 	}
+	createVethContext.log.Debugf("LETHE_TIMING step=container.RouteReplaceGateway contVeth=%s duration_ms=%d err=<nil>",
+		createVethContext.contVethName, time.Since(start).Milliseconds())
 
 	if createVethContext.index > 0 {
 		// Add a from interface rule
@@ -216,13 +259,19 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		fromInterfaceRule.Priority = networkutils.FromInterfaceRulePriority
 		fromInterfaceRule.Table = rtTable
 		fromInterfaceRule.Family = family
+		start = time.Now()
 		if err := createVethContext.netLink.RuleAdd(fromInterfaceRule); err != nil && !networkutils.IsRuleExistsError(err) {
+			createVethContext.log.Debugf("LETHE_TIMING step=container.RuleAddFromInterface contVeth=%s duration_ms=%d err=%v",
+				createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 			return errors.Wrapf(err, "failed to setup fromInterface rule, containerAddr=%s, rtTable=%v", createVethContext.ipAddr.String(), createVethContext.index)
 		}
+		createVethContext.log.Debugf("LETHE_TIMING step=container.RuleAddFromInterface contVeth=%s duration_ms=%d err=<nil>",
+			createVethContext.contVethName, time.Since(start).Milliseconds())
 	}
 
 	// Add a default route via dummy next hop(169.254.1.1 or fe80::1). Then all outgoing traffic will be routed by this
 	// default route via dummy next hop (169.254.1.1 or fe80::1)
+	start = time.Now()
 	if err = createVethContext.netLink.RouteAdd(&netlink.Route{
 		LinkIndex: contVeth.Attrs().Index,
 		Scope:     netlink.SCOPE_UNIVERSE,
@@ -230,12 +279,21 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		Gw:        gw,
 		Table:     rtTable,
 	}); err != nil {
+		createVethContext.log.Debugf("LETHE_TIMING step=container.RouteAddDefault contVeth=%s duration_ms=%d err=%v",
+			createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 		return errors.Wrap(err, "setup NS network: failed to add default route")
 	}
+	createVethContext.log.Debugf("LETHE_TIMING step=container.RouteAddDefault contVeth=%s duration_ms=%d err=<nil>",
+		createVethContext.contVethName, time.Since(start).Milliseconds())
 
+	start = time.Now()
 	if err = createVethContext.netLink.AddrAdd(contVeth, addr); err != nil {
+		createVethContext.log.Debugf("LETHE_TIMING step=container.AddrAdd contVeth=%s duration_ms=%d err=%v",
+			createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 		return errors.Wrapf(err, "setup NS network: failed to add IP addr to %q", createVethContext.contVethName)
 	}
+	createVethContext.log.Debugf("LETHE_TIMING step=container.AddrAdd contVeth=%s duration_ms=%d err=<nil>",
+		createVethContext.contVethName, time.Since(start).Milliseconds())
 
 	// add static ARP entry for default gateway
 	// we are using routed mode on the host and container need this static ARP entry to resolve its default gateway.
@@ -247,20 +305,19 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		HardwareAddr: hostVeth.Attrs().HardwareAddr,
 	}
 
+	start = time.Now()
 	if err = createVethContext.netLink.NeighAdd(neigh); err != nil {
+		createVethContext.log.Debugf("LETHE_TIMING step=container.NeighAdd contVeth=%s duration_ms=%d err=%v",
+			createVethContext.contVethName, time.Since(start).Milliseconds(), err)
 		return errors.Wrap(err, "setup NS network: failed to add static ARP")
 	}
+	createVethContext.log.Debugf("LETHE_TIMING step=container.NeighAdd contVeth=%s duration_ms=%d err=<nil>",
+		createVethContext.contVethName, time.Since(start).Milliseconds())
 	// if IP is not IPv4 or a v4 in v6 address, it return nil
 	if !networkutils.IsIPv4(createVethContext.ipAddr.IP) {
 		if err := cniutils.WaitForAddressesToBeStable(createVethContext.netLink, createVethContext.contVethName, v6DADTimeout, WAIT_INTERVAL); err != nil {
 			return errors.Wrap(err, "setup NS network: failed while waiting for v6 addresses to be stable")
 		}
-	}
-
-	// Now that the everything has been successfully set up in the container, move the "host" end of the
-	// veth into the host namespace.
-	if err = createVethContext.netLink.LinkSetNsFd(hostVeth, int(hostNS.Fd())); err != nil {
-		return errors.Wrap(err, "setup NS network: failed to move veth to host netns")
 	}
 	return nil
 }
@@ -394,23 +451,30 @@ func (n *linuxNetwork) setupVeth(hostVethName string, contVethName string, netns
 		}
 		log.Debugf("Successfully deleted old hostVeth %s", hostVethName)
 	}
-	macAddrStr, err := NewMACGenerator().generateUniqueRandomMAC()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to generate Unique MAC addr for host side veth")
-	}
+	macAddrStr := generateHostVethMAC(hostVethName, ipAddr)
 	macAddr, err := net.ParseMAC(macAddrStr)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse unique generated mac addr %s", macAddrStr)
+		return nil, errors.Wrapf(err, "failed to parse generated mac addr %s", macAddrStr)
 	}
 	createVethContext := newCreateVethPairContext(contVethName, hostVethName, ipAddr, mtu, index, macAddr, log)
+	start := time.Now()
 	if err := n.ns.WithNetNSPath(netnsPath, createVethContext.run); err != nil {
+		log.Debugf("LETHE_TIMING step=host.WithNetNSPath hostVeth=%s duration_ms=%d err=%v",
+			hostVethName, time.Since(start).Milliseconds(), err)
 		return nil, errors.Wrap(err, "failed to setup veth network")
 	}
+	log.Debugf("LETHE_TIMING step=host.WithNetNSPath hostVeth=%s duration_ms=%d err=<nil>",
+		hostVethName, time.Since(start).Milliseconds())
 
+	start = time.Now()
 	hostVeth, err := n.netLink.LinkByName(hostVethName)
 	if err != nil {
+		log.Debugf("LETHE_TIMING step=host.LinkByNameHost hostVeth=%s duration_ms=%d err=%v",
+			hostVethName, time.Since(start).Milliseconds(), err)
 		return nil, errors.Wrapf(err, "failed to find hostVeth %s", hostVethName)
 	}
+	log.Debugf("LETHE_TIMING step=host.LinkByNameHost hostVeth=%s duration_ms=%d err=<nil>",
+		hostVethName, time.Since(start).Milliseconds())
 
 	// For IPv6, host veth sysctls must be set to:
 	// 1. accept_ra=0
@@ -438,9 +502,14 @@ func (n *linuxNetwork) setupVeth(hostVethName string, contVethName string, netns
 
 	// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
 	// veth won't get a link local address unless it's set to UP state.
+	start = time.Now()
 	if err = n.netLink.LinkSetUp(hostVeth); err != nil {
+		log.Debugf("LETHE_TIMING step=host.LinkSetUpHost hostVeth=%s duration_ms=%d err=%v",
+			hostVethName, time.Since(start).Milliseconds(), err)
 		return nil, errors.Wrapf(err, "failed to setup hostVeth %s", hostVethName)
 	}
+	log.Debugf("LETHE_TIMING step=host.LinkSetUpHost hostVeth=%s duration_ms=%d err=<nil>",
+		hostVethName, time.Since(start).Milliseconds())
 	return hostVeth, nil
 }
 
@@ -522,10 +591,15 @@ func (n *linuxNetwork) setupIPBasedContainerRouteRules(hostVeth netlink.Link, co
 		Dst:       containerAddr,
 		Table:     unix.RT_TABLE_MAIN,
 	}
+	start := time.Now()
 	if err := n.netLink.RouteReplace(&route); err != nil {
+		log.Debugf("LETHE_TIMING step=host.RouteReplaceToContainer containerAddr=%s hostVeth=%s duration_ms=%d err=%v",
+			containerAddr.String(), hostVeth.Attrs().Name, time.Since(start).Milliseconds(), err)
 		return errors.Wrapf(err, "failed to setup container route, containerAddr=%s, hostVeth=%s, rtTable=%v",
 			containerAddr.String(), hostVeth.Attrs().Name, "main")
 	}
+	log.Debugf("LETHE_TIMING step=host.RouteReplaceToContainer containerAddr=%s hostVeth=%s duration_ms=%d err=<nil>",
+		containerAddr.String(), hostVeth.Attrs().Name, time.Since(start).Milliseconds())
 	log.Debugf("Successfully setup container route, containerAddr=%s, hostVeth=%s, rtTable=%v",
 		containerAddr.String(), hostVeth.Attrs().Name, "main")
 
@@ -533,9 +607,14 @@ func (n *linuxNetwork) setupIPBasedContainerRouteRules(hostVeth netlink.Link, co
 	toContainerRule.Dst = containerAddr
 	toContainerRule.Priority = networkutils.ToContainerRulePriority
 	toContainerRule.Table = unix.RT_TABLE_MAIN
+	start = time.Now()
 	if err := n.netLink.RuleAdd(toContainerRule); err != nil && !networkutils.IsRuleExistsError(err) {
+		log.Debugf("LETHE_TIMING step=host.RuleAddToContainer containerAddr=%s duration_ms=%d err=%v",
+			containerAddr.String(), time.Since(start).Milliseconds(), err)
 		return errors.Wrapf(err, "failed to setup toContainer rule, containerAddr=%s, rtTable=%v", containerAddr.String(), "main")
 	}
+	log.Debugf("LETHE_TIMING step=host.RuleAddToContainer containerAddr=%s duration_ms=%d err=<nil>",
+		containerAddr.String(), time.Since(start).Milliseconds())
 
 	log.Debugf("Successfully setup toContainer rule, containerAddr=%s, rtTable=%v", containerAddr.String(), "main")
 
@@ -692,43 +771,15 @@ func buildVlanLink(vlanName string, vlanID int, parentIfIndex int, eniMAC string
 	return &netlink.Vlan{LinkAttrs: la, VlanId: vlanID}
 }
 
-type MACGenerator struct {
-	netlink   netlinkwrapper.NetLink
-	randMACfn func() string
-}
-
-func NewMACGenerator() MACGenerator {
-	return MACGenerator{netlink: netlinkwrapper.NewNetLink(), randMACfn: generateRandomMAC}
-}
-
-func generateRandomMAC() string {
-	mac := make([]byte, 6)
-	rand.Read(mac)
+func generateHostVethMAC(hostVethName string, ipAddr *net.IPNet) string {
+	seed := hostVethName
+	if ipAddr != nil {
+		seed = fmt.Sprintf("%s|%s", hostVethName, ipAddr.String())
+	}
+	mac := sha256.Sum256([]byte(seed))
 	// Set the local bit and unset the multicast bit
 	mac[0] = (mac[0] | 2) & 0xfe
 
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
 		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
-}
-
-// generateUniqueRandomMAC will compare randomly generated Mac to mac addresses of veth already present in host.
-func (m MACGenerator) generateUniqueRandomMAC() (string, error) {
-	ll, err := m.netlink.LinkList()
-	if err != nil {
-		return "", err
-	}
-	macMap := make(map[string]struct{})
-	for _, link := range ll {
-		if link.Attrs() != nil {
-			macMap[link.Attrs().HardwareAddr.String()] = struct{}{}
-		}
-	}
-
-	for i := 0; i < MAX_MAC_GENERATION_ATTEMPTS; i++ {
-		macAttempt := m.randMACfn()
-		if _, ok := macMap[macAttempt]; !ok {
-			return macAttempt, nil
-		}
-	}
-	return "", errors.New(fmt.Sprintf("failed to generate unique mac after %d attempts.", MAX_MAC_GENERATION_ATTEMPTS))
 }
