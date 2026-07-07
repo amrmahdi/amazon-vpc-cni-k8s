@@ -45,6 +45,7 @@ const (
 	//to move to stable state before error'ing out.
 	v6DADTimeout                = 10 * time.Second
 	MAX_MAC_GENERATION_ATTEMPTS = 10
+	letheTimingLogPrefix        = "LETHE_MAC_ATTEMPT"
 )
 
 type VirtualInterfaceMetadata struct {
@@ -394,7 +395,7 @@ func (n *linuxNetwork) setupVeth(hostVethName string, contVethName string, netns
 		}
 		log.Debugf("Successfully deleted old hostVeth %s", hostVethName)
 	}
-	macAddrStr, err := NewMACGenerator().generateUniqueRandomMAC()
+	macAddrStr, err := NewMACGenerator(log).generateUniqueRandomMAC()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate Unique MAC addr for host side veth")
 	}
@@ -695,10 +696,11 @@ func buildVlanLink(vlanName string, vlanID int, parentIfIndex int, eniMAC string
 type MACGenerator struct {
 	netlink   netlinkwrapper.NetLink
 	randMACfn func() string
+	log       logger.Logger
 }
 
-func NewMACGenerator() MACGenerator {
-	return MACGenerator{netlink: netlinkwrapper.NewNetLink(), randMACfn: generateRandomMAC}
+func NewMACGenerator(log logger.Logger) MACGenerator {
+	return MACGenerator{netlink: netlinkwrapper.NewNetLink(), randMACfn: generateRandomMAC, log: log}
 }
 
 func generateRandomMAC() string {
@@ -713,9 +715,16 @@ func generateRandomMAC() string {
 
 // generateUniqueRandomMAC will compare randomly generated Mac to mac addresses of veth already present in host.
 func (m MACGenerator) generateUniqueRandomMAC() (string, error) {
+	start := time.Now()
 	ll, err := m.netlink.LinkList()
 	if err != nil {
+		if m.log != nil {
+			m.log.Debugf("%s step=LinkList duration_ms=%d err=%v", letheTimingLogPrefix, time.Since(start).Milliseconds(), err)
+		}
 		return "", err
+	}
+	if m.log != nil {
+		m.log.Debugf("%s step=LinkList duration_ms=%d links=%d err=<nil>", letheTimingLogPrefix, time.Since(start).Milliseconds(), len(ll))
 	}
 	macMap := make(map[string]struct{})
 	for _, link := range ll {
@@ -727,8 +736,17 @@ func (m MACGenerator) generateUniqueRandomMAC() (string, error) {
 	for i := 0; i < MAX_MAC_GENERATION_ATTEMPTS; i++ {
 		macAttempt := m.randMACfn()
 		if _, ok := macMap[macAttempt]; !ok {
+			if m.log != nil {
+				m.log.Debugf("%s step=Accept attempt=%d collisions=%d max_attempts=%d", letheTimingLogPrefix, i+1, i, MAX_MAC_GENERATION_ATTEMPTS)
+			}
 			return macAttempt, nil
 		}
+		if m.log != nil {
+			m.log.Debugf("%s step=Collision attempt=%d max_attempts=%d", letheTimingLogPrefix, i+1, MAX_MAC_GENERATION_ATTEMPTS)
+		}
+	}
+	if m.log != nil {
+		m.log.Debugf("%s step=Exhausted attempts=%d", letheTimingLogPrefix, MAX_MAC_GENERATION_ATTEMPTS)
 	}
 	return "", errors.New(fmt.Sprintf("failed to generate unique mac after %d attempts.", MAX_MAC_GENERATION_ATTEMPTS))
 }
