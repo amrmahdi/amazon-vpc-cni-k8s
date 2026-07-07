@@ -123,21 +123,11 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		},
 		PeerName:         createVethContext.hostVethName,
 		PeerHardwareAddr: createVethContext.hostMACAddr,
+		PeerNamespace:    netlink.NsFd(int(hostNS.Fd())),
 	}
 
 	if err := createVethContext.netLink.LinkAdd(veth); err != nil {
 		return err
-	}
-
-	hostVeth, err := createVethContext.netLink.LinkByName(createVethContext.hostVethName)
-	if err != nil {
-		return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.hostVethName)
-	}
-
-	// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
-	// veth won't get a link local address unless it's set to UP state.
-	if err = createVethContext.netLink.LinkSetUp(hostVeth); err != nil {
-		return errors.Wrapf(err, "setup NS network: failed to set link %q up", createVethContext.hostVethName)
 	}
 
 	contVeth, err := createVethContext.netLink.LinkByName(createVethContext.contVethName)
@@ -244,7 +234,7 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		LinkIndex:    contVeth.Attrs().Index,
 		State:        netlink.NUD_PERMANENT,
 		IP:           gwNet.IP,
-		HardwareAddr: hostVeth.Attrs().HardwareAddr,
+		HardwareAddr: createVethContext.hostMACAddr,
 	}
 
 	if err = createVethContext.netLink.NeighAdd(neigh); err != nil {
@@ -257,11 +247,6 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		}
 	}
 
-	// Now that the everything has been successfully set up in the container, move the "host" end of the
-	// veth into the host namespace.
-	if err = createVethContext.netLink.LinkSetNsFd(hostVeth, int(hostNS.Fd())); err != nil {
-		return errors.Wrap(err, "setup NS network: failed to move veth to host netns")
-	}
 	return nil
 }
 
